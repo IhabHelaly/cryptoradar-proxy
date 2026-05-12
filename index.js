@@ -1,29 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// CryptoRadar Binance Proxy v1
+// CryptoRadar Proxy v2
 //
-// A tiny Node.js HTTP server that forwards authenticated requests to Binance.
-// Deploy this somewhere in a Binance-allowed region (Singapore recommended)
-// so your Cloudflare Worker can reach Binance even when its own IPs are
-// geo-blocked (HTTP 451).
+// Tiny Node.js HTTP server that forwards requests to multiple upstream APIs.
+// Deploy in a permissive region (Singapore) so Cloudflare Worker can reach
+// IP-restricted services even when its own egress IPs are blocked.
 //
-// How it works:
-//   1. Cloudflare Worker makes a request to https://YOUR_PROXY/binance/<path>
-//   2. Worker includes header x-proxy-secret: <shared secret>
-//   3. This proxy verifies the secret, strips /binance prefix, forwards to
-//      https://api.binance.com/<path> with the X-MBX-APIKEY header intact
-//   4. Returns Binance's response verbatim
+// Routes:
+//   GET  /                  → health check (returns "alive", no auth)
+//   ANY  /binance/<path>    → forwards to https://api.binance.com/<path>
+//   GET  /coingecko/<path>  → forwards to https://api.coingecko.com/<path>  (NEW in v2)
+//
+// All non-health paths require x-proxy-secret header matching PROXY_SECRET env var.
 //
 // Setup:
-//   - Set PROXY_SECRET env var to any random string (must match what you set
-//     in your Cloudflare Worker)
-//   - Optional: set PORT (defaults to 8080)
-//   - Run: node index.js
-//
-// Security notes:
-//   - PROXY_SECRET prevents random people from using your proxy
-//   - The proxy never reads or stores your Binance API key/secret
-//   - Only forwards X-MBX-APIKEY header; all signing happens in the worker
-//   - Health check at /  (returns "alive" without auth — used for uptime checks)
+//   Set PROXY_SECRET env var (Render Environment Variables tab)
+//   Run: node index.js
 // ═══════════════════════════════════════════════════════════════════════════
 
 const http = require('http');
@@ -33,7 +24,6 @@ const PROXY_SECRET = process.env.PROXY_SECRET || '';
 
 if (!PROXY_SECRET) {
   console.error('FATAL: PROXY_SECRET environment variable must be set.');
-  console.error('Generate a random string and set it in your hosting platform.');
   process.exit(1);
 }
 
@@ -41,7 +31,11 @@ if (PROXY_SECRET.length < 16) {
   console.warn('WARNING: PROXY_SECRET is short (<16 chars). Use a longer random string.');
 }
 
-const BINANCE_BASE = 'https://api.binance.com';
+// Upstream routing table — path prefix → upstream base URL
+const UPSTREAMS = {
+  '/binance/':   'https://api.binance.com',
+  '/coingecko/': 'https://api.coingecko.com',
+};
 
 const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
@@ -49,7 +43,7 @@ const server = http.createServer(async (req, res) => {
     // ── Health check (no auth required) ───────────────────────────────────
     if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('CryptoRadar Binance Proxy v1 — alive');
+      res.end('CryptoRadar Proxy v2 — alive · binance + coingecko routing');
       return;
     }
 
@@ -60,43 +54,50 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ── Only allow /binance/* paths ───────────────────────────────────────
-    if (!req.url.startsWith('/binance/')) {
+    // ── Determine upstream from path prefix ───────────────────────────────
+    let upstream = null;
+    let prefixLen = 0;
+    for (const [prefix, baseUrl] of Object.entries(UPSTREAMS)) {
+      if (req.url.startsWith(prefix)) {
+        upstream = baseUrl;
+        prefixLen = prefix.length - 1; // keep the leading slash from the path
+        break;
+      }
+    }
+    if (!upstream) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'path must start with /binance/' }));
+      res.end(JSON.stringify({ error: 'unknown route prefix. supported: /binance/* /coingecko/*' }));
       return;
     }
 
-    // ── Strip /binance prefix, forward to Binance ─────────────────────────
-    const binancePath = req.url.slice('/binance'.length); // keeps leading /
-    const binanceUrl  = BINANCE_BASE + binancePath;
+    // Strip the matched prefix to get the upstream path
+    const upstreamPath = req.url.slice(prefixLen);
+    const upstreamUrl  = upstream + upstreamPath;
 
-    // Collect request body (for POST endpoints like /sapi/v1/asset/get-funding-asset)
+    // Collect request body (for POSTs)
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const reqBody = Buffer.concat(chunks);
 
-    // Build headers to forward — only the Binance API key header
+    // Build headers to forward — only API-key style headers we explicitly allow
     const forwardHeaders = {};
-    if (req.headers['x-mbx-apikey']) {
-      forwardHeaders['X-MBX-APIKEY'] = req.headers['x-mbx-apikey'];
-    }
+    if (req.headers['x-mbx-apikey'])  forwardHeaders['X-MBX-APIKEY']  = req.headers['x-mbx-apikey'];
+    // CoinGecko doesn't need a special header for free tier; queries pass via query string
 
-    // Forward to Binance using native fetch (Node 18+)
-    const binanceResp = await fetch(binanceUrl, {
+    const upstreamResp = await fetch(upstreamUrl, {
       method: req.method,
       headers: forwardHeaders,
       body: (req.method !== 'GET' && reqBody.length > 0) ? reqBody : undefined,
     });
 
-    const respBody = await binanceResp.arrayBuffer();
-    const contentType = binanceResp.headers.get('content-type') || 'application/json';
+    const respBody = await upstreamResp.arrayBuffer();
+    const contentType = upstreamResp.headers.get('content-type') || 'application/json';
 
-    res.writeHead(binanceResp.status, { 'Content-Type': contentType });
+    res.writeHead(upstreamResp.status, { 'Content-Type': contentType });
     res.end(Buffer.from(respBody));
 
     const ms = Date.now() - startTime;
-    console.log(`${req.method} ${binancePath} → ${binanceResp.status} (${ms}ms)`);
+    console.log(`${req.method} ${upstreamPath} → ${upstreamResp.status} (${ms}ms) [${upstream}]`);
   } catch (e) {
     console.error('Proxy error:', e.message);
     if (!res.headersSent) {
@@ -107,9 +108,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`CryptoRadar Binance Proxy v1 listening on port ${PORT}`);
+  console.log(`CryptoRadar Proxy v2 listening on port ${PORT}`);
+  console.log(`Upstreams: ${Object.entries(UPSTREAMS).map(([p,u]) => p + ' → ' + u).join(', ')}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 process.on('SIGINT',  () => server.close(() => process.exit(0)));
