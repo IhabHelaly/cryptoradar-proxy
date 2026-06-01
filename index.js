@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// CryptoRadar Proxy v2
+// CryptoRadar Proxy v3
 //
 // Tiny Node.js HTTP server that forwards requests to multiple upstream APIs.
 // Deploy in a permissive region (Singapore) so Cloudflare Worker can reach
@@ -8,7 +8,9 @@
 // Routes:
 //   GET  /                  → health check (returns "alive", no auth)
 //   ANY  /binance/<path>    → forwards to https://api.binance.com/<path>
-//   GET  /coingecko/<path>  → forwards to https://api.coingecko.com/<path>  (NEW in v2)
+//   GET  /coingecko/<path>  → forwards to https://api.coingecko.com/<path>
+//   GET  /upbit/<path>      → forwards to https://api.upbit.com/<path>      (NEW in v3)
+//   GET  /bithumb/<path>    → forwards to https://api.bithumb.com/<path>    (NEW in v3)
 //
 // All non-health paths require x-proxy-secret header matching PROXY_SECRET env var.
 //
@@ -35,6 +37,8 @@ if (PROXY_SECRET.length < 16) {
 const UPSTREAMS = {
   '/binance/':   'https://api.binance.com',
   '/coingecko/': 'https://api.coingecko.com',
+  '/upbit/':     'https://api.upbit.com',
+  '/bithumb/':   'https://api.bithumb.com',
 };
 
 const server = http.createServer(async (req, res) => {
@@ -43,7 +47,7 @@ const server = http.createServer(async (req, res) => {
     // ── Health check (no auth required) ───────────────────────────────────
     if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('CryptoRadar Proxy v2 — alive · binance + coingecko routing');
+      res.end('CryptoRadar Proxy v3 — alive · binance + coingecko + upbit + bithumb routing');
       return;
     }
 
@@ -66,7 +70,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (!upstream) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'unknown route prefix. supported: /binance/* /coingecko/*' }));
+      res.end(JSON.stringify({ error: 'unknown route prefix. supported: /binance/* /coingecko/* /upbit/* /bithumb/*' }));
       return;
     }
 
@@ -108,7 +112,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`CryptoRadar Proxy v2 listening on port ${PORT}`);
+  console.log(`CryptoRadar Proxy v3 listening on port ${PORT}`);
   console.log(`Upstreams: ${Object.entries(UPSTREAMS).map(([p,u]) => p + ' → ' + u).join(', ')}`);
 });
 
